@@ -1,0 +1,2 @@
+# This directory stores model checkpoints during training.
+# Checkpoint files (*.pt) are excluded from version control.
