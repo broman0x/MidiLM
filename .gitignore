@@ -1,1 +1,10 @@
-mp3
+mp3/
+checkpoints/
+llama.cpp/
+*.gguf
+*.pt
+__pycache__/
+.ipynb_checkpoints/
+dataset/example_dataset.json
+tokenizer.json
+outputs/

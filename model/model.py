@@ -1,125 +1,175 @@
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
 
 class MidiLMConfig:
-    def __init__(
-        self,
-        vocab_size=2500,
-        max_seq_len=1024,
-        n_layers=8,
-        n_heads=12,
-        d_model=768,
-        d_ff=3072,
-        dropout=0.1,
-        pad_token_id=0,
-        bos_token_id=1,
-        eos_token_id=2,
-    ):
+    def __init__(self, vocab_size=16384, n_embd=768, n_layer=12, n_head=12, n_inner=None, 
+                 resid_pdrop=0.1, embd_pdrop=0.1, attn_pdrop=0.1, layer_norm_epsilon=1e-5, 
+                 initializer_range=0.02, max_position_embeddings=2048, rope_theta=10000.0):
         self.vocab_size = vocab_size
-        self.max_seq_len = max_seq_len
-        self.n_layers = n_layers
-        self.n_heads = n_heads
-        self.d_model = d_model
-        self.d_ff = d_ff
-        self.dropout = dropout
-        self.pad_token_id = pad_token_id
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-
-    def to_dict(self):
-        return self.__dict__.copy()
+        self.hidden_size = n_embd
+        self.num_hidden_layers = n_layer
+        self.num_attention_heads = n_head
+        self.intermediate_size = n_inner if n_inner is not None else 4 * n_embd
+        self.resid_pdrop = resid_pdrop
+        self.embd_pdrop = embd_pdrop
+        self.attn_pdrop = attn_pdrop
+        self.rms_norm_eps = layer_norm_epsilon
+        self.initializer_range = initializer_range
+        self.max_position_embeddings = max_position_embeddings
+        self.rope_theta = rope_theta
 
     @classmethod
     def from_dict(cls, d):
-        return cls(**d)
+        config = cls()
+        for k, v in d.items():
+            if hasattr(config, k):
+                setattr(config, k, v)
+            elif k == "num_hidden_layers": config.num_hidden_layers = v
+            elif k == "num_attention_heads": config.num_attention_heads = v
+            elif k == "hidden_size": config.hidden_size = v
+            elif k == "intermediate_size": config.intermediate_size = v
+        return config
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len):
+    def to_dict(self):
+        return {
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_attention_heads,
+            "intermediate_size": self.intermediate_size,
+            "rms_norm_eps": self.rms_norm_eps,
+            "max_position_embeddings": self.max_position_embeddings,
+            "rope_theta": self.rope_theta,
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"]
+        }
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
-    def forward(self, x, offset=0):
-        return x + self.pe[:, offset : offset + x.size(1), :]
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
-class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_heads, dropout, max_seq_len):
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
+def precompute_freqs_cis(dim, end, theta=10000.0):
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+    t = torch.arange(end, device=freqs.device)
+    freqs = torch.outer(t, freqs).float()
+    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+    return freqs_cis
+
+def reshape_for_broadcast(freqs_cis, x):
+    ndim = x.ndim
+    assert 0 <= 1 < ndim
+    assert freqs_cis.shape == (x.shape[1], x.shape[-1])
+    shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
+    return freqs_cis.view(*shape)
+
+def apply_rotary_emb(xq, xk, freqs_cis):
+    xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+    xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+    xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+class LlamaAttention(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.n_heads = n_heads
-        self.head_dim = d_model // n_heads
-        self.qkv = nn.Linear(d_model, 3 * d_model)
-        self.out_proj = nn.Linear(d_model, d_model)
-        self.attn_drop = nn.Dropout(dropout)
-        self.resid_drop = nn.Dropout(dropout)
-        self.register_buffer("mask", torch.tril(torch.ones(max_seq_len, max_seq_len)).unsqueeze(0).unsqueeze(0))
+        self.n_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=False)
 
-    def forward(self, x, layer_past=None, use_cache=False):
-        B, T, C = x.size()
-        qkv = self.qkv(x)
-        q, k, v = qkv.split(C, dim=-1)
-        q = q.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_heads, self.head_dim).transpose(1, 2)
-        if layer_past is not None:
-            k = torch.cat((layer_past[0], k), dim=-2)
-            v = torch.cat((layer_past[1], v), dim=-2)
-        present = (k, v) if use_cache else None
-        attn = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
-        if layer_past is None:
-            attn = attn.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))
-        attn = F.softmax(attn, dim=-1)
-        y = (self.attn_drop(attn) @ v).transpose(1, 2).contiguous().view(B, T, C)
-        return self.resid_drop(self.out_proj(y)), present
+    def forward(self, x, freqs_cis, mask=None):
+        bsz, seqlen, _ = x.shape
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xk = xk.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xv = xv.view(bsz, seqlen, self.n_heads, self.head_dim)
+        xq, xk = apply_rotary_emb(xq, xk, freqs_cis=freqs_cis)
+        xq = xq.transpose(1, 2)
+        xk = xk.transpose(1, 2)
+        xv = xv.transpose(1, 2)
+        scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
+        if mask is not None:
+            scores = scores + mask[:, :, :seqlen, :seqlen]
+        scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+        output = torch.matmul(scores, xv)
+        output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
+        return self.o_proj(output)
 
-class TransformerBlock(nn.Module):
-    def __init__(self, d_model, n_heads, d_ff, dropout, max_seq_len):
+class LlamaMLP(nn.Module):
+    def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = CausalSelfAttention(d_model, n_heads, dropout, max_seq_len)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.ff = nn.Sequential(nn.Linear(d_model, d_ff), nn.GELU(), nn.Linear(d_ff, d_model), nn.Dropout(dropout))
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
 
-    def forward(self, x, layer_past=None, use_cache=False):
-        a, p = self.attn(self.ln1(x), layer_past=layer_past, use_cache=use_cache)
-        x = x + a
-        x = x + self.ff(self.ln2(x))
-        return x, p
+    def forward(self, x):
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+class LlamaDecoderLayer(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.self_attn = LlamaAttention(config)
+        self.mlp = LlamaMLP(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+
+    def forward(self, x, freqs_cis, mask=None):
+        h = x + self.self_attn(self.input_layernorm(x), freqs_cis, mask)
+        out = h + self.mlp(self.post_attention_layernorm(h))
+        return out
+
+class LlamaModel(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
 class MidiLM(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.token_emb = nn.Embedding(config.vocab_size, config.d_model)
-        self.pos_enc = PositionalEncoding(config.d_model, config.max_seq_len)
-        self.drop = nn.Dropout(config.dropout)
-        self.blocks = nn.ModuleList([TransformerBlock(config.d_model, config.n_heads, config.d_ff, config.dropout, config.max_seq_len) for _ in range(config.n_layers)])
-        self.ln_f = nn.LayerNorm(config.d_model)
-        self.head = nn.Linear(config.d_model, config.vocab_size, bias=False)
-        self.head.weight = self.token_emb.weight
-        self.apply(self._init_weights)
+        self.model = LlamaModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.freqs_cis = precompute_freqs_cis(config.hidden_size // config.num_attention_heads, config.max_position_embeddings, config.rope_theta)
 
-    def _init_weights(self, module):
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, std=0.02)
-            if hasattr(module, "bias") and module.bias is not None: nn.init.zeros_(module.bias)
+    def forward(self, input_ids, targets=None):
+        bsz, seqlen = input_ids.shape
+        h = self.model.embed_tokens(input_ids)
+        self.freqs_cis = self.freqs_cis.to(h.device)
+        freqs_cis = self.freqs_cis[:seqlen]
+        mask = None
+        if seqlen > 1:
+            mask = torch.full((seqlen, seqlen), float("-inf"), device=h.device)
+            mask = torch.triu(mask, diagonal=1)
+            mask = mask.view(1, 1, seqlen, seqlen)
+        for layer in self.model.layers:
+            h = layer(h, freqs_cis, mask)
+        h = self.model.norm(h)
+        logits = self.lm_head(h)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss, None
 
-    def forward(self, input_ids, targets=None, past_key_values=None, use_cache=False):
-        B, T = input_ids.size()
-        offset = past_key_values[0][0].size(-2) if past_key_values is not None else 0
-        x = self.drop(self.pos_enc(self.token_emb(input_ids), offset=offset))
-        presents = []
-        for i, block in enumerate(self.blocks):
-            x, p = block(x, layer_past=past_key_values[i] if past_key_values is not None else None, use_cache=use_cache)
-            if use_cache: presents.append(p)
-        logits = self.head(self.ln_f(x))
-        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=self.config.pad_token_id) if targets is not None else None
-        return logits, loss, presents
-
-    def count_parameters(self):
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+if __name__ == "__main__":
+    config = MidiLMConfig(vocab_size=1000, n_layer=2, n_head=4, n_embd=128)
+    model = MidiLM(config)
+    x = torch.randint(0, 1000, (1, 10))
+    logits, loss, _ = model(x, targets=x)
+    print(f"DONE: {logits.shape}")

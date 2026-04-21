@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.dirname(__file__))
 
 from model.model import MidiLM, MidiLMConfig
-from utils import MidiLMDataset, build_prompt_vocab, save_checkpoint, load_checkpoint
+from utils import MidiLMDataset, save_checkpoint, load_checkpoint, load_tokenizer
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -38,22 +38,19 @@ def main():
     args = parse_args()
     if args.colab: args.checkpoint_dir = "/content/drive/MyDrive/MidiLM/checkpoints"
     os.makedirs(args.checkpoint_dir, exist_ok=True)
-    if not os.path.exists(args.dataset):
-        print(f"Error: Dataset {args.dataset} not found. Run prepare_data.py first.")
-        return
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    prompt_vocab, total_vocab = build_prompt_vocab(args.dataset)
-    config = MidiLMConfig(vocab_size=total_vocab)
+    if not os.path.exists("tokenizer.json"):
+        return
+    tokenizer = load_tokenizer("tokenizer.json")
+    vocab_size = tokenizer.get_vocab_size()
+    config = MidiLMConfig(vocab_size=vocab_size)
     model = MidiLM(config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.1)
     scaler = GradScaler('cuda')
     global_step = 0
     if args.resume and os.path.isfile(args.resume):
-        global_step, _, _, _ = load_checkpoint(args.resume, model, optimizer)
-    dataset = MidiLMDataset(args.dataset, prompt_vocab)
-    if len(dataset) == 0:
-        print("Error: Dataset is empty. Check your MIDI source folder and run prepare_data.py.")
-        return
+        global_step, _, _ = load_checkpoint(args.resume, model, optimizer)
+    dataset = MidiLMDataset(args.dataset, tokenizer)
     dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, pin_memory=True, num_workers=0)
     total_steps = len(dataloader) * args.epochs
     scheduler = get_lr_scheduler(optimizer, args.warmup_steps, total_steps)
@@ -76,14 +73,13 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 scheduler.step()
                 global_step += 1
-            epoch_loss += loss.item() * args.grad_accum
+                epoch_loss += loss.item() * args.grad_accum
         avg_loss = epoch_loss / len(dataloader)
-        print(f"Epoch {epoch+1} loss: {avg_loss}")
         if avg_loss < best_loss:
             best_loss = avg_loss
-            save_checkpoint(model, optimizer, global_step, config, prompt_vocab, total_vocab, os.path.join(args.checkpoint_dir, "best.pt"))
-        if (epoch + 1) % args.save_every == 0 or (epoch + 1) == args.epochs:
-            save_checkpoint(model, optimizer, global_step, config, prompt_vocab, total_vocab, os.path.join(args.checkpoint_dir, "latest.pt"))
+            save_checkpoint(model, optimizer, global_step, config, tokenizer, os.path.join(args.checkpoint_dir, "best.pt"))
+        if (epoch + 1) % args.save_every == 0:
+            save_checkpoint(model, optimizer, global_step, config, tokenizer, os.path.join(args.checkpoint_dir, "latest.pt"))
 
 if __name__ == "__main__":
     main()

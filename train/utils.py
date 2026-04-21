@@ -3,6 +3,7 @@ import os
 import torch
 from torch.utils.data import Dataset
 import sys
+from tokenizers import Tokenizer
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -16,62 +17,30 @@ from tokenizer.midi_tokenizer import (
     encode,
 )
 
-PROMPT_SEP = "SEP"
-
-def build_prompt_vocab(dataset_path):
-    global VOCAB_SIZE, ID_TO_TOKEN
-    with open(dataset_path, "r") as f:
-        data = json.load(f)
-    words = set()
-    lyric_tokens = set()
-    for sample in data:
-        for word in sample["prompt"].split():
-            words.add(word)
-        for tok in sample["tokens"].split():
-            if tok.startswith("LYRIC_"):
-                if tok not in TOKEN_TO_ID:
-                    lyric_tokens.add(tok)
-    
-    for tok in sorted(lyric_tokens):
-        if tok not in TOKEN_TO_ID:
-            TOKEN_TO_ID[tok] = VOCAB_SIZE
-            ID_TO_TOKEN[VOCAB_SIZE] = tok
-            VOCAB_SIZE += 1
-            
-    start_id = VOCAB_SIZE
-    vocab = {PROMPT_SEP: start_id}
-    start_id += 1
-    for word in sorted(words):
-        vocab[word] = start_id
-        start_id += 1
-    return vocab, start_id
-
-def tokenize_prompt(prompt_text, prompt_vocab):
-    ids = []
-    for word in prompt_text.split():
-        if word in prompt_vocab:
-            ids.append(prompt_vocab[word])
-    return ids
+def load_tokenizer(path="tokenizer.json"):
+    return Tokenizer.from_file(path)
 
 class MidiLMDataset(Dataset):
-    def __init__(self, dataset_path, prompt_vocab, max_seq_len=1024):
+    def __init__(self, dataset_path, tokenizer, max_seq_len=1024):
         with open(dataset_path, "r") as f:
             self.raw_data = json.load(f)
-        self.prompt_vocab = prompt_vocab
+        self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.samples = []
         self._prepare()
 
     def _prepare(self):
-        sep_id = self.prompt_vocab[PROMPT_SEP]
+        bos_id = self.tokenizer.token_to_id("[BOS]")
+        eos_id = self.tokenizer.token_to_id("[EOS]")
+        pad_id = self.tokenizer.token_to_id("[PAD]")
+        sep_id = self.tokenizer.token_to_id("SEP")
         for item in self.raw_data:
-            prompt_ids = tokenize_prompt(item["prompt"], self.prompt_vocab)
-            music_tokens = tokens_from_string(item["tokens"])
-            music_ids = [TOKEN_TO_ID[t] for t in music_tokens if t in TOKEN_TO_ID]
-            seq = [BOS_ID] + prompt_ids + [sep_id] + music_ids + [EOS_ID]
-            seq = seq[: self.max_seq_len]
+            prompt_encoded = self.tokenizer.encode(item["prompt"]).ids
+            music_encoded = self.tokenizer.encode(item["tokens"]).ids
+            seq = [bos_id] + prompt_encoded + [sep_id] + music_encoded + [eos_id]
+            seq = seq[:self.max_seq_len]
             while len(seq) < self.max_seq_len:
-                seq.append(PAD_ID)
+                seq.append(pad_id)
             self.samples.append(seq)
 
     def __len__(self):
@@ -81,15 +50,14 @@ class MidiLMDataset(Dataset):
         seq = self.samples[idx]
         return torch.tensor(seq[:-1], dtype=torch.long), torch.tensor(seq[1:], dtype=torch.long)
 
-def save_checkpoint(model, optimizer, step, config, prompt_vocab, total_vocab, path):
+def save_checkpoint(model, optimizer, step, config, tokenizer, path):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save({
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "step": step,
         "config": config.to_dict(),
-        "prompt_vocab": prompt_vocab,
-        "total_vocab": total_vocab,
+        "vocab_size": tokenizer.get_vocab_size(),
     }, path)
 
 def load_checkpoint(path, model, optimizer=None):
@@ -97,4 +65,4 @@ def load_checkpoint(path, model, optimizer=None):
     model.load_state_dict(checkpoint["model_state_dict"])
     if optimizer is not None and "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    return checkpoint.get("step", 0), checkpoint.get("config", {}), checkpoint.get("prompt_vocab", {}), checkpoint.get("total_vocab", VOCAB_SIZE)
+    return checkpoint.get("step", 0), checkpoint.get("config", {}), checkpoint.get("vocab_size", 8192)
