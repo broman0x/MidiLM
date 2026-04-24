@@ -2,7 +2,7 @@ import os
 import json
 from tokenizers import Tokenizer
 from tokenizers.models import BPE
-from tokenizers.trainers import Bptrainer
+from tokenizers.trainers import BpeTrainer
 from tokenizers.pre_tokenizers import Whitespace
 from pathlib import Path
 import sys
@@ -30,7 +30,7 @@ def train_tokenizer(dataset_path, vocab_size=16384):
     
     special_tokens = ["[PAD]", "[BOS]", "[EOS]", "[UNK]", "SEP"] + ALL_TOKENS
     
-    trainer = Bptrainer(
+    trainer = BpeTrainer(
         vocab_size=vocab_size,
         special_tokens=special_tokens,
         min_frequency=2,
